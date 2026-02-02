@@ -262,6 +262,198 @@ def debug_osm(lat: float, lon: float, radius: float):
             click.echo(f"  {name} ({highway}): {length:.0f}m")
 
 
+@cli.command("tune")
+@click.argument("input_dir", type=click.Path(exists=True, path_type=Path))
+@click.option(
+    "--config",
+    type=click.Path(exists=True, path_type=Path),
+    help="Path to configuration YAML file",
+)
+def tune(input_dir: Path, config: Path):
+    """Analyze an image and suggest parameter tuning.
+
+    INPUT_DIR: Directory containing image_native.tif and coordinates.json
+    """
+    import json
+    import numpy as np
+    from .preprocessing.enhancement import ImageEnhancer
+    from .preprocessing.road_extraction import RoadExtractor
+    from .graph.image_graph import ImageGraphBuilder
+    from .graph.osm_graph import OSMGraphBuilder
+    from .matching.features import FeatureExtractor
+    from .matching.spectral import SpectralMatcher
+
+    # Load config
+    if config:
+        georef_config = GeoreferenceConfig.from_yaml(config)
+    else:
+        georef_config = GeoreferenceConfig.default()
+
+    click.echo(f"\n{'='*60}")
+    click.echo(f"Tuning Analysis: {input_dir}")
+    click.echo(f"{'='*60}\n")
+
+    # Load coordinates
+    coords_file = input_dir / "coordinates.json"
+    with open(coords_file) as f:
+        coords = json.load(f)
+    lat = coords.get("latitude", coords.get("lat"))
+    lon = coords.get("longitude", coords.get("lon"))
+
+    # Initialize components
+    enhancer = ImageEnhancer(georef_config.preprocessing)
+    extractor = RoadExtractor(georef_config.preprocessing)
+    graph_builder = ImageGraphBuilder()
+    osm_builder = OSMGraphBuilder(georef_config.osm)
+    feature_extractor = FeatureExtractor()
+    spectral_matcher = SpectralMatcher()
+
+    # Load and process image
+    image_file = input_dir / "image_native.tif"
+    if not image_file.exists():
+        image_file = input_dir / "image_medium.jpg"
+
+    click.echo("1. Analyzing image...")
+    image = enhancer.load_image(image_file)
+    road_result = extractor.extract(image)
+
+    click.echo(f"   Image size: {image.shape[1]} x {image.shape[0]}")
+    click.echo(f"   Road pixels: {road_result.stats['road_pixels']}")
+    click.echo(f"   Road coverage: {road_result.stats['road_coverage_ratio']:.2%}")
+
+    # Build graph
+    click.echo("\n2. Analyzing road graph...")
+    image_graph = graph_builder.build_graph(road_result.skeleton)
+    img_stats = graph_builder.compute_graph_stats(image_graph)
+
+    click.echo(f"   Nodes: {img_stats['num_nodes']}")
+    click.echo(f"   Edges: {img_stats['num_edges']}")
+    click.echo(f"   Junctions (degree>=3): {img_stats['num_junctions']}")
+
+    # Degree distribution
+    degrees = [image_graph.degree(n) for n in image_graph.nodes()]
+    degree_counts = {}
+    for d in degrees:
+        degree_counts[d] = degree_counts.get(d, 0) + 1
+
+    click.echo("   Degree distribution:")
+    for d in sorted(degree_counts.keys())[:6]:
+        click.echo(f"     Degree {d}: {degree_counts[d]} nodes")
+
+    # Fetch OSM data
+    click.echo("\n3. Analyzing OSM data...")
+    osm_graph = osm_builder.fetch_road_network(lat, lon, radius_miles=2.0)
+    osm_graph, proj_info = osm_builder.project_to_local_crs(osm_graph, lat, lon)
+    osm_stats = osm_builder.compute_graph_stats(osm_graph)
+
+    click.echo(f"   OSM nodes: {osm_stats['num_nodes']}")
+    click.echo(f"   OSM edges: {osm_stats['num_edges']}")
+
+    # Try matching
+    click.echo("\n4. Testing feature matching...")
+    candidates = feature_extractor.find_candidate_correspondences(
+        image_graph, osm_graph, min_degree=2
+    )
+
+    unique_img = len(set(c[0] for c in candidates))
+    unique_osm = len(set(c[1] for c in candidates))
+    click.echo(f"   Candidates (min_degree=2): {len(candidates)}")
+    click.echo(f"   Unique image nodes: {unique_img}")
+    click.echo(f"   Unique OSM nodes: {unique_osm}")
+
+    # Also try with min_degree=1
+    candidates_d1 = feature_extractor.find_candidate_correspondences(
+        image_graph, osm_graph, min_degree=1
+    )
+    click.echo(f"   Candidates (min_degree=1): {len(candidates_d1)}")
+
+    # Try scale/rotation hypothesis
+    click.echo("\n5. Testing scale/rotation hypotheses...")
+    hypotheses = spectral_matcher.match_with_scale_rotation(
+        image_graph, osm_graph, proj_info,
+        scale_range=(0.3, 3.0),
+        scale_steps=15,
+        rotation_range=(-90, 90),
+        rotation_steps=18,
+    )
+
+    if hypotheses:
+        click.echo(f"   Found {len(hypotheses)} valid hypotheses")
+        click.echo("   Top 3 hypotheses:")
+        for i, h in enumerate(hypotheses[:3]):
+            click.echo(
+                f"     {i+1}. scale={h['scale']:.2f} m/px, "
+                f"rotation={h['rotation']:.0f}°, "
+                f"matches={h['num_matches']}, "
+                f"quality={h['quality']:.2f}"
+            )
+    else:
+        click.echo("   No valid hypotheses found")
+
+    # Generate recommendations
+    click.echo(f"\n{'='*60}")
+    click.echo("RECOMMENDATIONS:")
+    click.echo(f"{'='*60}\n")
+
+    issues = []
+    recommendations = []
+
+    # Check road coverage
+    if road_result.stats['road_coverage_ratio'] < 0.02:
+        issues.append("Very low road coverage (<2%)")
+        recommendations.append("Image may be mostly water/vegetation - try adjusting canny thresholds")
+        recommendations.append("  canny_low_threshold: 30 (lower = more edges)")
+        recommendations.append("  canny_high_threshold: 100")
+
+    # Check graph quality
+    if img_stats['num_junctions'] == 0:
+        issues.append("No road intersections detected")
+        recommendations.append("Road extraction is fragmented - try:")
+        recommendations.append("  morph_kernel_size: 5 (larger = more connected)")
+        recommendations.append("  morph_close_iterations: 3")
+
+    if img_stats['num_edges'] < 20:
+        issues.append(f"Very few road segments ({img_stats['num_edges']})")
+        recommendations.append("Increase morphological closing to connect fragments")
+
+    # Check matching
+    if unique_osm < 5:
+        issues.append(f"Only {unique_osm} unique OSM nodes matched")
+        recommendations.append("Try relaxing matching constraints:")
+        recommendations.append("  degree_must_match: false")
+        recommendations.append("  angle_tolerance_deg: 30")
+
+    if len(candidates) < 10:
+        issues.append("Very few matching candidates")
+        recommendations.append("Expand search radius or relax matching")
+
+    # Check hypotheses
+    if hypotheses and hypotheses[0]['num_matches'] >= 5:
+        best = hypotheses[0]
+        recommendations.append(f"Scale/rotation search found a good match!")
+        recommendations.append(f"  Estimated scale: {best['scale']:.2f} m/pixel")
+        recommendations.append(f"  Estimated rotation: {best['rotation']:.0f}°")
+    elif not hypotheses:
+        issues.append("No valid scale/rotation hypotheses")
+        recommendations.append("The road pattern may not match modern OSM roads")
+        recommendations.append("Try expanding the search ranges:")
+        recommendations.append("  scale_range: [0.2, 5.0]")
+        recommendations.append("  rotation_range_deg: [-180, 180]")
+
+    if issues:
+        click.echo(click.style("Issues found:", fg="yellow"))
+        for issue in issues:
+            click.echo(f"  - {issue}")
+        click.echo()
+
+    if recommendations:
+        click.echo(click.style("Suggested changes to config.yaml:", fg="cyan"))
+        for rec in recommendations:
+            click.echo(f"  {rec}")
+    else:
+        click.echo(click.style("No specific issues found - try running with default config", fg="green"))
+
+
 @cli.command("diagnose")
 @click.argument("subcommand", type=click.Choice(["geotiff", "transform", "matching", "steps"]))
 @click.argument("path", type=click.Path(exists=True, path_type=Path))

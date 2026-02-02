@@ -10,11 +10,15 @@ import logging
 from .config import GeoreferenceConfig, ImageMetadata, PreprocessingConfig
 from .preprocessing.enhancement import ImageEnhancer
 from .preprocessing.road_extraction import RoadExtractor, RoadExtractionResult
+from .preprocessing.water_extraction import WaterExtractor, WaterExtractionResult
 from .graph.image_graph import ImageGraphBuilder
 from .graph.osm_graph import OSMGraphBuilder
+from .graph.osm_water import OSMWaterFetcher, OSMWaterResult
 from .matching.features import FeatureExtractor
 from .matching.spectral import SpectralMatcher
 from .matching.ransac import RANSACMatcher, RANSACResult
+from .matching.shoreline_matcher import ShorelineMatcher
+from .matching.combined_matcher import CombinedMatcher
 from .output.transform import TransformEstimator, GeoTransform
 from .output.quality import QualityAssessor, QualityMetrics
 from .output.geotiff import GeoTIFFWriter
@@ -67,6 +71,26 @@ class GeoreferencePipeline:
         )
         self.geotiff_writer = GeoTIFFWriter(output_crs=self.config.output.output_crs)
 
+        # Initialize water feature components (if enabled)
+        self.water_extractor = None
+        self.osm_water_fetcher = None
+        self.shoreline_matcher = None
+        self.combined_matcher = None
+
+        if self.config.water.enabled:
+            self.water_extractor = WaterExtractor(self.config.water)
+            self.osm_water_fetcher = OSMWaterFetcher(
+                self.config.water, self.config.osm
+            )
+            self.shoreline_matcher = ShorelineMatcher(
+                self.config.water, self.config.matching
+            )
+            self.combined_matcher = CombinedMatcher(
+                road_weight=1.0,
+                shoreline_weight=self.config.water.shoreline_weight,
+                water_config=self.config.water,
+            )
+
     def process(
         self,
         image_path: Path,
@@ -98,6 +122,21 @@ class GeoreferencePipeline:
 
             if road_result.stats["road_pixels"] < 100:
                 logger.warning("Very few roads detected in image")
+
+            # Step 2b: Extract water features (if enabled)
+            water_result = None
+            if self.config.water.enabled and self.water_extractor:
+                logger.info("Extracting water bodies and shorelines")
+                try:
+                    water_result = self.water_extractor.extract(image)
+                    debug_info["water_stats"] = water_result.stats
+                    if water_result.stats["has_significant_water"]:
+                        logger.info(
+                            f"Found {water_result.stats['num_water_bodies']} water bodies, "
+                            f"{water_result.stats['water_coverage_ratio']:.1%} water coverage"
+                        )
+                except Exception as e:
+                    logger.warning(f"Water extraction failed: {e}")
 
             # Step 3: Build image graph
             logger.info("Building graph from detected roads")
@@ -159,6 +198,30 @@ class GeoreferencePipeline:
                 except (ValueError, TypeError):
                     pass
 
+            # Step 4b: Fetch OSM water features (if enabled)
+            osm_water = None
+            if self.config.water.enabled and self.osm_water_fetcher:
+                logger.info("Fetching OSM water features")
+                try:
+                    osm_water = self.osm_water_fetcher.fetch_water_features(
+                        metadata.latitude, metadata.longitude, radius
+                    )
+                    if osm_water.stats["total_features"] > 0:
+                        osm_water, _ = self.osm_water_fetcher.project_to_local_crs(
+                            osm_water, metadata.latitude, metadata.longitude
+                        )
+                        debug_info["osm_water_stats"] = osm_water.stats
+                        logger.info(
+                            f"Found {osm_water.stats['num_coastlines']} coastlines, "
+                            f"{osm_water.stats['num_lakes']} lakes, "
+                            f"{osm_water.stats['num_rivers']} rivers"
+                        )
+                    else:
+                        osm_water = None
+                except Exception as e:
+                    logger.warning(f"OSM water fetch failed: {e}")
+                    osm_water = None
+
             # Step 5: Find candidate correspondences
             logger.info("Finding candidate correspondences")
             candidates = self.feature_extractor.find_candidate_correspondences(
@@ -178,7 +241,44 @@ class GeoreferencePipeline:
                     ]
                 debug_info["spectral_candidates"] = len(candidates)
 
-            if len(candidates) < self.config.matching.min_correspondences:
+            # Step 5b: Find shoreline correspondences (if water features available)
+            shoreline_correspondences = []
+            if (
+                self.config.water.enabled
+                and water_result
+                and osm_water
+                and water_result.shoreline_contours
+                and osm_water.combined_shoreline_meters
+                and self.shoreline_matcher
+            ):
+                logger.info("Matching shorelines")
+                try:
+                    shoreline_correspondences = self.shoreline_matcher.match(
+                        water_result.shoreline_contours,
+                        osm_water.combined_shoreline_meters,
+                    )
+                    debug_info["shoreline_correspondences"] = len(shoreline_correspondences)
+                    if shoreline_correspondences:
+                        logger.info(f"Found {len(shoreline_correspondences)} shoreline correspondences")
+                except Exception as e:
+                    logger.warning(f"Shoreline matching failed: {e}")
+
+            # Step 5c: Combine road and shoreline correspondences
+            combined_candidates = None
+            if shoreline_correspondences and self.combined_matcher:
+                logger.info("Combining road and shoreline correspondences")
+                combined_corr = self.combined_matcher.merge_correspondences(
+                    candidates, shoreline_correspondences, image_graph, osm_graph
+                )
+                debug_info["combined_stats"] = self.combined_matcher.get_statistics(combined_corr)
+
+                # Convert to RANSAC format (point tuples instead of node IDs)
+                combined_candidates = self.combined_matcher.to_ransac_format(combined_corr)
+                debug_info["combined_correspondences"] = len(combined_candidates)
+
+            # Check if we have enough correspondences (road + shoreline combined)
+            total_correspondences = len(candidates) + len(shoreline_correspondences)
+            if total_correspondences < self.config.matching.min_correspondences:
                 return GeoreferenceResult(
                     success=False,
                     confidence_score=0.0,
@@ -191,9 +291,62 @@ class GeoreferencePipeline:
 
             # Step 6: RANSAC matching
             logger.info("Running RANSAC for robust matching")
-            ransac_result = self.ransac_matcher.iterative_ransac(
-                image_graph, osm_graph, candidates
-            )
+
+            # Track whether we're using combined or road-only correspondences
+            using_combined = False
+            ransac_result = None
+
+            # Try combined correspondences first (if available)
+            if combined_candidates and len(combined_candidates) >= self.config.matching.min_correspondences:
+                logger.info(f"Trying RANSAC with {len(combined_candidates)} combined (road + shoreline) correspondences")
+                ransac_result = self.ransac_matcher.ransac_from_points(combined_candidates)
+                if ransac_result:
+                    using_combined = True
+                    debug_info["ransac_source"] = "combined"
+
+            # Fall back to road-only correspondences
+            if ransac_result is None:
+                logger.info("Trying RANSAC with road correspondences only")
+                ransac_result = self.ransac_matcher.iterative_ransac(
+                    image_graph, osm_graph, candidates
+                )
+                if ransac_result:
+                    debug_info["ransac_source"] = "road_only"
+
+            # If RANSAC fails, try scale/rotation hypothesis search
+            if ransac_result is None:
+                logger.info("RANSAC failed, trying scale/rotation hypothesis search")
+                hypotheses = self.spectral_matcher.match_with_scale_rotation(
+                    image_graph,
+                    osm_graph,
+                    projection_info,
+                    scale_range=self.config.matching.scale_range,
+                    scale_steps=self.config.matching.scale_steps,
+                    rotation_range=self.config.matching.rotation_range_deg,
+                    rotation_steps=self.config.matching.rotation_steps,
+                )
+
+                if hypotheses:
+                    best = hypotheses[0]
+                    logger.info(
+                        f"Best hypothesis: scale={best['scale']:.3f}, "
+                        f"rotation={best['rotation']:.1f}°, "
+                        f"matches={best['num_matches']}"
+                    )
+                    debug_info["hypothesis_search"] = {
+                        "num_hypotheses": len(hypotheses),
+                        "best_scale": best["scale"],
+                        "best_rotation": best["rotation"],
+                        "best_matches": best["num_matches"],
+                    }
+
+                    # Try RANSAC on the best hypothesis candidates
+                    best_candidates = best["correspondences"]
+                    ransac_result = self.ransac_matcher.iterative_ransac(
+                        image_graph, osm_graph, best_candidates
+                    )
+                    if ransac_result:
+                        debug_info["ransac_source"] = "hypothesis_search"
 
             if ransac_result is None:
                 return GeoreferenceResult(
@@ -216,14 +369,24 @@ class GeoreferencePipeline:
             # Extract point coordinates for transformation
             image_points = []
             geo_points = []
-            for img_node, osm_node in ransac_result.inlier_correspondences:
-                img_data = image_graph.nodes[img_node]
-                osm_data = osm_graph.nodes[osm_node]
 
-                image_points.append([img_data["x"], img_data["y"]])
-                geo_points.append(
-                    [osm_data.get("x_meters", 0), osm_data.get("y_meters", 0)]
-                )
+            if using_combined and combined_candidates:
+                # For combined correspondences, inlier indices refer to combined_candidates
+                for idx, _ in ransac_result.inlier_correspondences:
+                    if idx < len(combined_candidates):
+                        img_pt, osm_pt, _ = combined_candidates[idx]
+                        image_points.append(list(img_pt))
+                        geo_points.append(list(osm_pt))
+            else:
+                # For road-only correspondences, use node IDs
+                for img_node, osm_node in ransac_result.inlier_correspondences:
+                    img_data = image_graph.nodes[img_node]
+                    osm_data = osm_graph.nodes[osm_node]
+
+                    image_points.append([img_data["x"], img_data["y"]])
+                    geo_points.append(
+                        [osm_data.get("x_meters", 0), osm_data.get("y_meters", 0)]
+                    )
 
             image_points = np.array(image_points)
             geo_points = np.array(geo_points)

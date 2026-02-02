@@ -64,26 +64,28 @@ class MatchingConfig:
     """Configuration for graph matching algorithms."""
 
     # Correspondence requirements
-    min_correspondences: int = 4
+    min_correspondences: int = 3
     min_correspondences_sparse: int = 3  # For low road coverage images
 
     # RANSAC parameters
-    ransac_threshold_meters: float = 10.0
-    ransac_max_iterations: int = 1000
+    # Note: Historical images need larger threshold due to road network changes
+    ransac_threshold_meters: float = 50.0
+    ransac_max_iterations: int = 2000
     ransac_confidence: float = 0.99
 
     # Spectral matching
     spectral_embedding_dim: int = 10
 
     # Scale/rotation search ranges
-    scale_range: Tuple[float, float] = (0.5, 2.0)
-    scale_steps: int = 10
-    rotation_range_deg: Tuple[float, float] = (-30.0, 30.0)
-    rotation_steps: int = 12
+    # Wide ranges to handle unknown historical image scale/orientation
+    scale_range: Tuple[float, float] = (0.2, 3.0)
+    scale_steps: int = 15
+    rotation_range_deg: Tuple[float, float] = (-90.0, 90.0)
+    rotation_steps: int = 18
 
     # Feature matching tolerances
-    angle_tolerance_deg: float = 15.0
-    length_ratio_tolerance: float = 0.3
+    angle_tolerance_deg: float = 20.0
+    length_ratio_tolerance: float = 0.4
     degree_must_match: bool = True
 
 
@@ -92,17 +94,20 @@ class QualityConfig:
     """Configuration for quality assessment."""
 
     # Confidence thresholds
-    min_confidence_score: float = 0.5
-    high_confidence_threshold: float = 0.8
+    # Relaxed for historical images where roads may have changed
+    min_confidence_score: float = 0.3
+    high_confidence_threshold: float = 0.7
 
     # Error thresholds
-    max_residual_error_meters: float = 10.0
-    max_rmse_meters: float = 15.0
+    # Historical images typically have 20-50m accuracy
+    max_residual_error_meters: float = 50.0
+    max_rmse_meters: float = 50.0
 
     # Coverage requirements
+    # Many historical images have sparse road networks
     min_matched_roads: int = 3
-    min_coverage_ratio: float = 0.3  # Matched area / image area
-    min_distribution_score: float = 0.5
+    min_coverage_ratio: float = 0.1  # Matched area / image area
+    min_distribution_score: float = 0.3
 
 
 @dataclass
@@ -122,6 +127,35 @@ class OutputConfig:
 
 
 @dataclass
+class WaterConfig:
+    """Configuration for water/shoreline detection and matching."""
+
+    # Enable/disable water feature matching
+    enabled: bool = True
+
+    # Water detection parameters
+    water_intensity_threshold: float = -1.5  # Std devs below median for water
+    min_water_area_px: int = 500  # Minimum water body size in pixels
+    texture_window_size: int = 15  # Window for local variance calculation
+    texture_variance_threshold: float = 100.0  # Max variance for water regions
+
+    # Shoreline extraction
+    min_shoreline_length_px: int = 50  # Minimum shoreline segment length
+    contour_smoothing_epsilon: float = 0.005  # Fraction of arc length for smoothing
+
+    # OSM water features
+    fetch_coastlines: bool = True
+    fetch_lakes: bool = True
+    fetch_rivers: bool = True
+    min_lake_area_m2: float = 1000.0  # Minimum lake area to fetch
+
+    # Matching parameters
+    max_shoreline_correspondences: int = 20  # Max points to extract per image
+    curvature_window_size: int = 5  # Window for curvature calculation
+    shoreline_weight: float = 1.5  # Weight relative to roads in RANSAC
+
+
+@dataclass
 class GeoreferenceConfig:
     """Main configuration combining all sub-configs."""
 
@@ -130,6 +164,7 @@ class GeoreferenceConfig:
     matching: MatchingConfig = field(default_factory=MatchingConfig)
     quality: QualityConfig = field(default_factory=QualityConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
+    water: WaterConfig = field(default_factory=WaterConfig)
 
     @classmethod
     def default(cls) -> "GeoreferenceConfig":
@@ -150,6 +185,7 @@ class GeoreferenceConfig:
             matching=MatchingConfig(**data.get("matching", {})),
             quality=QualityConfig(**data.get("quality", {})),
             output=OutputConfig(**data.get("output", {})),
+            water=WaterConfig(**data.get("water", {})),
         )
 
 

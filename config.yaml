@@ -1,0 +1,111 @@
+# Auto-Georeference Configuration
+# Copy this file and modify for your image collection
+
+preprocessing:
+  # CLAHE (Contrast Limited Adaptive Histogram Equalization)
+  clahe_clip_limit: 2.0
+  clahe_tile_grid_size: [8, 8]
+
+  # Bilateral filter (edge-preserving smoothing)
+  bilateral_d: 9
+  bilateral_sigma_color: 75.0
+  bilateral_sigma_space: 75.0
+
+  # Canny edge detection
+  # Lower values = more edges detected (more noise)
+  # Higher values = fewer edges (may miss faint roads)
+  canny_low_threshold: 50
+  canny_high_threshold: 150
+
+  # Morphological operations
+  # Larger kernel = thicker roads, more connected
+  # More iterations = more aggressive closing
+  morph_kernel_size: 3
+  morph_close_iterations: 2
+
+  # Filtering
+  min_road_length_px: 20
+  min_road_coverage_ratio: 0.05
+
+osm:
+  # Search radius from approximate coordinates
+  search_radius_miles: 1.0
+  expanded_radius_miles: 2.0
+
+  # Road types to include
+  network_type: "drive"
+
+  # Caching
+  use_cache: true
+
+matching:
+  # Minimum correspondences required
+  min_correspondences: 3
+  min_correspondences_sparse: 3
+
+  # RANSAC parameters
+  # Historical images need larger threshold due to road network changes
+  ransac_threshold_meters: 50.0
+  ransac_max_iterations: 2000
+  ransac_confidence: 0.99
+
+  # Scale/rotation search ranges
+  # Wide ranges to handle unknown historical image scale/orientation
+  scale_range: [0.2, 3.0]
+  scale_steps: 15
+  rotation_range_deg: [-90.0, 90.0]
+  rotation_steps: 18
+
+  # Feature matching
+  # Set to false to allow degree mismatches (more candidates but less precise)
+  degree_must_match: true
+  angle_tolerance_deg: 20.0
+  length_ratio_tolerance: 0.4
+
+quality:
+  # Confidence threshold to consider "successful"
+  # Relaxed for historical images where roads may have changed
+  min_confidence_score: 0.3
+
+  # Error thresholds
+  # Historical images typically have 20-50m accuracy
+  max_rmse_meters: 50.0
+
+  # Coverage requirements (relaxed for sparse images)
+  min_matched_roads: 3
+  min_coverage_ratio: 0.1
+
+output:
+  output_crs: "EPSG:4326"
+  write_geotiff: true
+  write_worldfile: true
+  write_metadata_json: true
+  write_debug_images: false
+
+water:
+  # Enable/disable water feature detection and matching
+  # Shorelines are more stable than roads over historical time periods
+  enabled: true
+
+  # Water detection parameters
+  # Water appears darker in grayscale imagery (std devs below median)
+  water_intensity_threshold: -1.5
+  min_water_area_px: 500
+  texture_window_size: 15
+  texture_variance_threshold: 100.0
+
+  # Shoreline extraction
+  min_shoreline_length_px: 50
+  contour_smoothing_epsilon: 0.005
+
+  # OSM water features to fetch
+  fetch_coastlines: true
+  fetch_lakes: true
+  fetch_rivers: true
+  min_lake_area_m2: 1000.0
+
+  # Matching parameters
+  max_shoreline_correspondences: 20
+  curvature_window_size: 5
+  # Shorelines weighted higher than roads (more temporally stable)
+  shoreline_weight: 1.5

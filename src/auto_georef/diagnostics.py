@@ -72,7 +72,7 @@ def check_geotiff(geotiff_path: Path):
         click.echo(f"{'='*60}")
 
         issues = []
-        if lon_span < 0.0001:
+        if abs(lon_span) < 0.0001:
             issues.append("CRITICAL: Longitude span is too small (< 0.0001 deg)")
         if abs(lat_span) < 0.0001:
             issues.append("CRITICAL: Latitude span is too small (< 0.0001 deg)")
@@ -85,9 +85,9 @@ def check_geotiff(geotiff_path: Path):
         if pixel_res_y < 0.01:
             issues.append("CRITICAL: Pixel resolution Y is essentially zero")
 
-        # Expected for typical aerial imagery: 0.1-1.0 m/pixel
-        if pixel_res_x > 0.01 and (pixel_res_x < 0.05 or pixel_res_x > 2.0):
-            issues.append(f"WARNING: Unusual pixel resolution ({pixel_res_x:.4f} m/px) - expected 0.05-2.0 m/px")
+        # Expected for typical aerial/historical imagery: 0.1-5.0 m/pixel
+        if pixel_res_x > 0.01 and (pixel_res_x < 0.05 or pixel_res_x > 5.0):
+            issues.append(f"WARNING: Unusual pixel resolution ({pixel_res_x:.4f} m/px) - expected 0.05-5.0 m/px")
 
         if issues:
             click.echo(click.style("Issues found:", fg="red"))
@@ -284,10 +284,13 @@ def visualize_steps(input_dir: Path, output_dir: Path):
     import cv2
     from .preprocessing.enhancement import ImageEnhancer
     from .preprocessing.road_extraction import RoadExtractor
+    from .preprocessing.water_extraction import WaterExtractor
     from .graph.image_graph import ImageGraphBuilder
     from .graph.osm_graph import OSMGraphBuilder
+    from .graph.osm_water import OSMWaterFetcher
     from .matching.features import FeatureExtractor
     from .matching.spectral import SpectralMatcher
+    from .matching.shoreline_matcher import ShorelineMatcher
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -329,6 +332,25 @@ def visualize_steps(input_dir: Path, output_dir: Path):
     skeleton_vis = (road_result.skeleton * 255).astype(np.uint8)
     cv2.imwrite(str(output_dir / "05_skeleton.png"), skeleton_vis)
     click.echo("  5. Saved road skeleton")
+
+    # Step 4b: Water extraction
+    click.echo("  5b. Extracting water features...")
+    water_extractor = WaterExtractor()
+    water_result = water_extractor.extract(original)
+
+    # Save water mask
+    cv2.imwrite(str(output_dir / "05b_water_mask.png"), water_result.water_mask)
+    click.echo(f"     Water coverage: {water_result.stats['water_coverage_ratio']:.1%}")
+    click.echo(f"     Water bodies found: {water_result.stats['num_water_bodies']}")
+
+    # Save shoreline contours overlaid on image
+    shoreline_vis = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+    for contour in water_result.shoreline_contours:
+        # Draw contour as cyan line
+        pts = contour.astype(np.int32).reshape(-1, 1, 2)
+        cv2.polylines(shoreline_vis, [pts], isClosed=True, color=(255, 255, 0), thickness=2)
+    cv2.imwrite(str(output_dir / "05c_shoreline_contours.png"), shoreline_vis)
+    click.echo(f"  5c. Saved shoreline contours ({len(water_result.shoreline_contours)} contours)")
 
     # Step 4: Graph overlay
     graph_builder = ImageGraphBuilder()
@@ -387,6 +409,55 @@ def visualize_steps(input_dir: Path, output_dir: Path):
     cv2.imwrite(str(output_dir / "07_osm_network.png"), osm_vis)
     click.echo("  7. Saved OSM network visualization")
 
+    # Step 7b: OSM water features
+    click.echo("  7b. Fetching OSM water features...")
+    osm_water_fetcher = OSMWaterFetcher()
+    osm_water = osm_water_fetcher.fetch_water_features(lat, lon, radius_miles=1.0)
+
+    if osm_water.stats["total_features"] > 0:
+        osm_water, _ = osm_water_fetcher.project_to_local_crs(osm_water, lat, lon)
+
+        # Create OSM water visualization
+        water_osm_vis = np.zeros((800, 800, 3), dtype=np.uint8)
+        water_osm_vis.fill(40)  # Dark gray background
+
+        # Get bounds from all water features
+        all_water_points = []
+        for shoreline in osm_water.combined_shoreline_meters:
+            all_water_points.extend(shoreline.tolist())
+
+        if all_water_points:
+            water_xs = [p[0] for p in all_water_points]
+            water_ys = [p[1] for p in all_water_points]
+            w_min_x, w_max_x = min(water_xs), max(water_xs)
+            w_min_y, w_max_y = min(water_ys), max(water_ys)
+            w_scale = 700 / max(w_max_x - w_min_x + 1, w_max_y - w_min_y + 1)
+
+            def to_water_vis(x, y):
+                vx = int((x - w_min_x) * w_scale + 50)
+                vy = int((w_max_y - y) * w_scale + 50)
+                return vx, vy
+
+            # Draw coastlines in blue
+            for coastline in osm_water.coastlines:
+                pts = np.array([to_water_vis(p[0], p[1]) for p in coastline], dtype=np.int32)
+                cv2.polylines(water_osm_vis, [pts], isClosed=False, color=(255, 100, 0), thickness=2)
+
+            # Draw lakes in cyan
+            for lake in osm_water.lakes:
+                pts = np.array([to_water_vis(p[0], p[1]) for p in lake], dtype=np.int32)
+                cv2.polylines(water_osm_vis, [pts], isClosed=True, color=(255, 255, 0), thickness=1)
+
+            # Draw rivers in light blue
+            for river in osm_water.rivers:
+                pts = np.array([to_water_vis(p[0], p[1]) for p in river], dtype=np.int32)
+                cv2.polylines(water_osm_vis, [pts], isClosed=False, color=(255, 150, 50), thickness=1)
+
+        cv2.imwrite(str(output_dir / "07b_osm_water.png"), water_osm_vis)
+        click.echo(f"  7b. Saved OSM water visualization (coastlines: {osm_water.stats['num_coastlines']}, lakes: {osm_water.stats['num_lakes']}, rivers: {osm_water.stats['num_rivers']})")
+    else:
+        click.echo("  7b. No OSM water features found in area")
+
     # Step 6: Matching candidates
     click.echo("  8. Computing matches...")
     feature_extractor = FeatureExtractor()
@@ -405,6 +476,28 @@ def visualize_steps(input_dir: Path, output_dir: Path):
     cv2.imwrite(str(output_dir / "08_match_candidates.png"), match_vis)
     click.echo("  8. Saved matching candidates")
 
+    # Step 8b: Shoreline matching (if water features available)
+    shoreline_matches = []
+    if water_result.shoreline_contours and osm_water.stats["total_features"] > 0:
+        click.echo("  8b. Computing shoreline matches...")
+        shoreline_matcher = ShorelineMatcher()
+        shoreline_matches = shoreline_matcher.match(
+            water_result.shoreline_contours,
+            osm_water.combined_shoreline_meters,
+        )
+
+        # Visualize shoreline matches on image
+        shoreline_match_vis = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+        for corr in shoreline_matches:
+            x, y = int(corr.image_point[0]), int(corr.image_point[1])
+            cv2.circle(shoreline_match_vis, (x, y), 8, (0, 255, 255), 2)  # Yellow circles
+            cv2.circle(shoreline_match_vis, (x, y), 3, (0, 255, 255), -1)
+
+        cv2.imwrite(str(output_dir / "08b_shoreline_matches.png"), shoreline_match_vis)
+        click.echo(f"  8b. Saved shoreline matches ({len(shoreline_matches)} correspondences)")
+    else:
+        click.echo("  8b. Skipped shoreline matching (no water features)")
+
     # Write summary
     summary = {
         "input_dir": str(input_dir),
@@ -416,9 +509,19 @@ def visualize_steps(input_dir: Path, output_dir: Path):
             "osm_nodes": osm_graph.number_of_nodes(),
             "osm_edges": osm_graph.number_of_edges(),
         },
+        "water_stats": {
+            "water_coverage_ratio": water_result.stats["water_coverage_ratio"],
+            "num_water_bodies": water_result.stats["num_water_bodies"],
+            "total_shoreline_length_px": water_result.stats["total_shoreline_length_px"],
+            "osm_coastlines": osm_water.stats.get("num_coastlines", 0),
+            "osm_lakes": osm_water.stats.get("num_lakes", 0),
+            "osm_rivers": osm_water.stats.get("num_rivers", 0),
+        },
         "matching": {
-            "candidates": len(candidates),
+            "road_candidates": len(candidates),
             "unique_osm_nodes": len(set(c[1] for c in candidates)),
+            "shoreline_correspondences": len(shoreline_matches),
+            "total_correspondences": len(candidates) + len(shoreline_matches),
         },
         "projection": proj_info,
     }

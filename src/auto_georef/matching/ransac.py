@@ -418,3 +418,100 @@ class RANSACMatcher:
                 break
 
         return best_result
+
+    def ransac_from_points(
+        self,
+        correspondences: List[Tuple[Tuple[float, float], Tuple[float, float], float]],
+    ) -> Optional[RANSACResult]:
+        """Run RANSAC on point-based correspondences (no graph lookup needed).
+
+        This is used for combined road + shoreline correspondences where
+        points are already extracted.
+
+        Args:
+            correspondences: List of (image_point, osm_point, distance) tuples
+                           where points are (x, y) coordinates.
+
+        Returns:
+            RANSACResult if successful, None otherwise.
+        """
+        if len(correspondences) < self.min_inliers:
+            return None
+
+        # Extract points
+        img_points = np.array([c[0] for c in correspondences])
+        osm_points = np.array([c[1] for c in correspondences])
+
+        best_inliers = None
+        best_num_inliers = 0
+        best_T = None
+        best_scale = 1.0
+        best_rotation = 0.0
+        best_translation = (0.0, 0.0)
+
+        n = len(correspondences)
+        iterations = 0
+        max_iterations = self.max_iterations
+
+        while iterations < max_iterations:
+            iterations += 1
+
+            if n < 3:
+                break
+
+            sample_indices = random.sample(range(n), 3)
+            sample_src = img_points[sample_indices]
+            sample_dst = osm_points[sample_indices]
+
+            T, scale, rotation, translation = self.estimate_similarity_transform(
+                sample_src, sample_dst
+            )
+
+            inliers = self.find_inliers(img_points, osm_points, T)
+            num_inliers = np.sum(inliers)
+
+            if num_inliers > best_num_inliers:
+                best_num_inliers = num_inliers
+                best_inliers = inliers
+                best_T = T
+                best_scale = scale
+                best_rotation = rotation
+                best_translation = translation
+
+                inlier_ratio = num_inliers / n
+                if inlier_ratio > 0:
+                    p = inlier_ratio**3
+                    if p < 1:
+                        k = np.log(1 - self.confidence) / np.log(1 - p)
+                        max_iterations = min(self.max_iterations, int(k) + 1)
+
+        if best_num_inliers < self.min_inliers:
+            return None
+
+        inlier_indices = np.where(best_inliers)[0]
+        inlier_src = img_points[inlier_indices]
+        inlier_dst = osm_points[inlier_indices]
+
+        refined_T, refined_scale, refined_rotation, refined_translation = (
+            self.estimate_similarity_transform(inlier_src, inlier_dst)
+        )
+
+        residuals = self.compute_residuals(inlier_src, inlier_dst, refined_T)
+        rmse = np.sqrt(np.mean(residuals**2))
+
+        # For point-based correspondences, we use index tuples instead of node IDs
+        inlier_correspondences = [(i, i) for i in inlier_indices]
+        outlier_indices = np.where(~best_inliers)[0]
+        outlier_correspondences = [(i, i) for i in outlier_indices]
+
+        return RANSACResult(
+            inlier_correspondences=inlier_correspondences,
+            outlier_correspondences=outlier_correspondences,
+            transformation_matrix=refined_T,
+            scale=refined_scale,
+            rotation_deg=refined_rotation,
+            translation=refined_translation,
+            inlier_ratio=best_num_inliers / n,
+            rmse=rmse,
+            num_iterations=iterations,
+        )
