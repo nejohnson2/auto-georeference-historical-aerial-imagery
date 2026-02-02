@@ -1,0 +1,76 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "auto-georef"
+version = "0.1.0"
+description = "Automatic georeferencing of historical aerial imagery using road network matching"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "Auto-Georeference Contributors"}
+]
+keywords = ["georeferencing", "aerial imagery", "GIS", "computer vision", "OpenStreetMap"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: GIS",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+dependencies = [
+    "opencv-python>=4.8.0",
+    "scikit-image>=0.21.0",
+    "Pillow>=10.0.0",
+    "osmnx>=1.6.0",
+    "networkx>=3.1",
+    "shapely>=2.0.0",
+    "pyproj>=3.6.0",
+    "rasterio>=1.3.0",
+    "geopandas>=0.14.0",
+    "numpy>=1.24.0",
+    "scipy>=1.11.0",
+    "scikit-learn>=1.3.0",
+    "click>=8.1.0",
+    "tqdm>=4.66.0",
+    "folium>=0.14.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+auto-georef = "auto_georef.main:main"
+
+[project.urls]
+Homepage = "https://github.com/example/auto-georeference"
+Documentation = "https://github.com/example/auto-georeference#readme"
+Repository = "https://github.com/example/auto-georeference"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[tool.black]
+line-length = 88
+target-version = ["py39", "py310", "py311", "py312"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py39"
+select = ["E", "F", "I", "N", "W"]
