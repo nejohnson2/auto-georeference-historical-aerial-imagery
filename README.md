@@ -1,4 +1,4 @@
-# Auto-Georeference
+# Auto-Georeference Historical Aerial Imagery
 
 Automatically georeference historical aerial images using road network and shoreline matching against OpenStreetMap data.
 

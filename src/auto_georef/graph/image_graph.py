@@ -1,11 +1,16 @@
 """Build road network graph from skeleton image."""
 
+import logging
 import numpy as np
 import networkx as nx
 from dataclasses import dataclass
 from typing import List, Tuple, Set, Optional
 from collections import deque
 from sklearn.cluster import DBSCAN
+from scipy.spatial import cKDTree
+from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -144,14 +149,18 @@ class ImageGraphBuilder:
         self,
         skeleton: np.ndarray,
         start: Tuple[int, int],
-        node_positions: Set[Tuple[int, int]],
+        node_tree: cKDTree,
+        start_node_idx: int,
+        max_path_length: int = 5000,
     ) -> Optional[RoadSegment]:
         """Trace a road segment from start until reaching another node.
 
         Args:
             skeleton: Binary skeleton image.
             start: Starting (y, x) position.
-            node_positions: Set of all node positions (junctions and endpoints).
+            node_tree: KD-tree of all node positions for fast lookup.
+            start_node_idx: Index of the starting node (to exclude from end check).
+            max_path_length: Maximum path length to trace (prevents infinite loops).
 
         Returns:
             RoadSegment if a valid segment is found, None otherwise.
@@ -160,7 +169,7 @@ class ImageGraphBuilder:
         visited = {start}
         current = start
 
-        while True:
+        while len(path) < max_path_length:
             neighbors = self.get_neighbors(skeleton, current[0], current[1])
             unvisited = [n for n in neighbors if n not in visited]
 
@@ -173,19 +182,9 @@ class ImageGraphBuilder:
             visited.add(next_pixel)
             path.append(next_pixel)
 
-            # Check if we've reached another node
-            # Use a small tolerance for floating point centroids
-            reached_node = False
-            for node_pos in node_positions:
-                if node_pos == start:
-                    continue
-                dist = np.sqrt(
-                    (next_pixel[0] - node_pos[0]) ** 2
-                    + (next_pixel[1] - node_pos[1]) ** 2
-                )
-                if dist < 2:  # Within 2 pixels of a node
-                    reached_node = True
-                    break
+            # Check if we've reached another node using KD-tree (O(log n) instead of O(n))
+            dist, nearest_idx = node_tree.query([next_pixel[0], next_pixel[1]])
+            reached_node = dist < 2 and nearest_idx != start_node_idx
 
             if reached_node or len(unvisited) > 1:
                 # Reached a node or a junction
@@ -232,25 +231,26 @@ class ImageGraphBuilder:
         return angle
 
     def _find_closest_node(
-        self, point: Tuple[int, int], nodes: List[Tuple[float, float]]
-    ) -> int:
-        """Find the index of the closest node to a point."""
-        min_dist = float("inf")
-        closest_idx = -1
+        self, point: Tuple[int, int], node_tree: cKDTree
+    ) -> Tuple[int, float]:
+        """Find the index and distance of the closest node to a point.
 
-        for i, node in enumerate(nodes):
-            dist = np.sqrt((point[0] - node[0]) ** 2 + (point[1] - node[1]) ** 2)
-            if dist < min_dist:
-                min_dist = dist
-                closest_idx = i
+        Args:
+            point: (y, x) pixel coordinates.
+            node_tree: KD-tree of node positions.
 
-        return closest_idx
+        Returns:
+            Tuple of (node_index, distance).
+        """
+        dist, idx = node_tree.query([point[0], point[1]])
+        return idx, dist
 
-    def build_graph(self, skeleton: np.ndarray) -> nx.Graph:
+    def build_graph(self, skeleton: np.ndarray, show_progress: bool = True) -> nx.Graph:
         """Build a NetworkX graph from the skeleton image.
 
         Args:
             skeleton: Binary skeleton image (single-pixel width roads).
+            show_progress: Whether to show progress bar.
 
         Returns:
             NetworkX Graph with:
@@ -258,30 +258,27 @@ class ImageGraphBuilder:
             - Edges: Road segments with length, orientation, and path attributes
         """
         # Find junctions and endpoints
+        logger.debug("Finding junctions...")
         raw_junctions = self.find_junctions(skeleton)
+        logger.debug("Finding endpoints...")
         endpoints = self.find_endpoints(skeleton)
 
         # Cluster nearby junctions
+        logger.debug(f"Clustering {len(raw_junctions)} raw junctions...")
         clustered_junctions = self.cluster_junctions(raw_junctions)
 
         # Combine all nodes (junctions first, then endpoints)
         all_nodes = list(clustered_junctions) + [(float(e[0]), float(e[1])) for e in endpoints]
 
+        logger.info(f"Found {len(clustered_junctions)} junctions, {len(endpoints)} endpoints ({len(all_nodes)} total nodes)")
+
         if not all_nodes:
             # No nodes found - return empty graph
             return nx.Graph()
 
-        # Create set of node positions for tracing
-        node_positions = set()
-        for node in all_nodes:
-            # Add integer-rounded positions
-            node_positions.add((int(round(node[0])), int(round(node[1]))))
-            # Add nearby pixels to catch traced paths
-            for dy in [-1, 0, 1]:
-                for dx in [-1, 0, 1]:
-                    node_positions.add(
-                        (int(round(node[0])) + dy, int(round(node[1])) + dx)
-                    )
+        # Build KD-tree for fast node lookups (O(log n) instead of O(n))
+        node_coords = np.array([[n[0], n[1]] for n in all_nodes])
+        node_tree = cKDTree(node_coords)
 
         # Create graph
         G = nx.Graph()
@@ -299,28 +296,38 @@ class ImageGraphBuilder:
 
         # Trace segments from each junction/endpoint
         visited_edges = set()
+        h, w = skeleton.shape
 
-        for node_idx, (node_y, node_x) in enumerate(all_nodes):
+        # Use tqdm progress bar for tracing
+        node_iter = enumerate(all_nodes)
+        if show_progress:
+            node_iter = tqdm(
+                list(node_iter),
+                desc="Tracing road segments",
+                unit="node",
+                leave=False,
+            )
+
+        for node_idx, (node_y, node_x) in node_iter:
             # Get starting pixel (rounded to integer)
             start_y, start_x = int(round(node_y)), int(round(node_x))
 
             # Find skeleton pixels near this node
-            h, w = skeleton.shape
             for dy in range(-2, 3):
                 for dx in range(-2, 3):
                     py, px = start_y + dy, start_x + dx
                     if 0 <= py < h and 0 <= px < w and skeleton[py, px] > 0:
                         # Try tracing from this pixel
                         segment = self.trace_road_segment(
-                            skeleton, (py, px), node_positions
+                            skeleton, (py, px), node_tree, node_idx
                         )
 
                         if segment and len(segment.path_points) >= 2:
-                            # Find end node
+                            # Find end node using KD-tree
                             end_point = segment.path_points[-1]
-                            end_node_idx = self._find_closest_node(end_point, all_nodes)
+                            end_node_idx, end_dist = self._find_closest_node(end_point, node_tree)
 
-                            if end_node_idx >= 0 and end_node_idx != node_idx:
+                            if end_node_idx != node_idx and end_dist < 5:
                                 # Create edge key (sorted to avoid duplicates)
                                 edge_key = tuple(sorted([node_idx, end_node_idx]))
 
@@ -338,6 +345,8 @@ class ImageGraphBuilder:
         # Compute node degrees
         for node in G.nodes():
             G.nodes[node]["degree"] = G.degree(node)
+
+        logger.info(f"Built graph with {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
 
         return G
 

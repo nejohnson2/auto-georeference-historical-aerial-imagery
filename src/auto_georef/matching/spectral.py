@@ -1,12 +1,16 @@
 """Spectral graph matching for road network alignment."""
 
+import logging
 import numpy as np
 import networkx as nx
 from typing import List, Tuple, Optional
 from scipy.optimize import linear_sum_assignment
 from scipy.linalg import eigh
+from tqdm import tqdm
 
 from .features import FeatureExtractor
+
+logger = logging.getLogger(__name__)
 
 
 class SpectralMatcher:
@@ -175,33 +179,43 @@ class SpectralMatcher:
         scales = np.linspace(scale_range[0], scale_range[1], scale_steps)
         rotations = np.linspace(rotation_range[0], rotation_range[1], rotation_steps)
 
-        for scale in scales:
-            for rotation in rotations:
-                # Transform image graph coordinates
-                transformed_graph = self._transform_image_graph(
-                    image_graph, scale, rotation
+        # Create all scale/rotation combinations
+        total_combinations = len(scales) * len(rotations)
+        combinations = [(s, r) for s in scales for r in rotations]
+
+        logger.info(f"Testing {total_combinations} scale/rotation hypotheses...")
+
+        for scale, rotation in tqdm(
+            combinations,
+            desc="Testing hypotheses",
+            unit="hyp",
+            leave=False,
+        ):
+            # Transform image graph coordinates
+            transformed_graph = self._transform_image_graph(
+                image_graph, scale, rotation
+            )
+
+            # Try matching
+            correspondences = self.match_by_embedding(
+                transformed_graph, osm_graph, degree_must_match=True
+            )
+
+            if len(correspondences) >= 3:
+                # Compute match quality
+                avg_distance = np.mean([c[2] for c in correspondences])
+                quality = len(correspondences) / (1 + avg_distance)
+
+                hypotheses.append(
+                    {
+                        "scale": scale,
+                        "rotation": rotation,
+                        "correspondences": correspondences,
+                        "num_matches": len(correspondences),
+                        "avg_distance": avg_distance,
+                        "quality": quality,
+                    }
                 )
-
-                # Try matching
-                correspondences = self.match_by_embedding(
-                    transformed_graph, osm_graph, degree_must_match=True
-                )
-
-                if len(correspondences) >= 3:
-                    # Compute match quality
-                    avg_distance = np.mean([c[2] for c in correspondences])
-                    quality = len(correspondences) / (1 + avg_distance)
-
-                    hypotheses.append(
-                        {
-                            "scale": scale,
-                            "rotation": rotation,
-                            "correspondences": correspondences,
-                            "num_matches": len(correspondences),
-                            "avg_distance": avg_distance,
-                            "quality": quality,
-                        }
-                    )
 
         # Sort by quality (higher is better)
         hypotheses.sort(key=lambda h: h["quality"], reverse=True)
