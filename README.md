@@ -1,17 +1,41 @@
 # Auto-Georeference
 
-Automatically georeference historical aerial images using road network matching against OpenStreetMap data.
+Automatically georeference historical aerial images using road network and shoreline matching against OpenStreetMap data.
+
+## Quick Start
+
+```bash
+# 1. Install dependencies
+python -m venv .venv
+source .venv/bin/activate
+pip install -e .
+
+# 2. Process a single image
+python -m auto_georef single data/000001 output/
+
+# 3. View the result
+python -m auto_georef visualize output/000001_georef.tif --open-browser
+
+# 4. Debug if needed
+python -m auto_georef diagnose steps data/000001 -o diagnostic_output/
+```
 
 ## Overview
 
 This tool processes historical aerial photographs (1930s-1980s) and attempts to automatically determine their geographic location and orientation by:
 
 1. Detecting road networks in the image using computer vision
-2. Building a graph representation of the detected roads
-3. Fetching reference road data from OpenStreetMap
-4. Matching the image graph against the OSM graph using spectral and feature-based methods
-5. Estimating a geographic transformation using RANSAC
-6. Generating a georeferenced GeoTIFF output
+2. Detecting water bodies and extracting shoreline contours (coastlines, lakes, rivers)
+3. Building graph representations of detected features
+4. Fetching reference road and water data from OpenStreetMap
+5. Matching image features against OSM using spectral and curvature-based methods
+6. Estimating a geographic transformation (with rotation) using RANSAC
+7. Generating a georeferenced GeoTIFF output
+
+**Key features:**
+- Supports arbitrary image rotations (north can be any direction)
+- Water/shoreline matching for coastal areas (shorelines are more stable over time than roads)
+- Automatically selects highest-resolution ("native") images
 
 ## Installation
 
@@ -42,10 +66,17 @@ Each image should be in its own directory with the following structure:
 ```
 data/
 └── 000001/
-    ├── image_native.tif    # The aerial image (required)
+    ├── image_native.tif    # High-res aerial image (required, any extension)
+    ├── image_medium.jpg    # Medium-res fallback (optional)
+    ├── image_thumbnail.jpg # Thumbnail (ignored)
     ├── coordinates.json    # Approximate location (required)
     └── metadata.json       # Additional metadata (optional)
 ```
+
+**Image file selection:**
+- The tool automatically finds and uses files with "native" in the name
+- Supported formats: `.tif`, `.tiff`, `.jpg`, `.jpeg`, `.png`
+- Falls back to other images if no "native" file exists (excludes thumbnails)
 
 ### coordinates.json
 
@@ -160,14 +191,16 @@ python -m auto_georef debug-osm <lat> <lon> [--radius 1.0]
 
 ## Output Files
 
-After processing, the output directory contains:
+After processing, the output directory contains files named after the input directory:
 
 | File | Description |
 |------|-------------|
-| `*_georef.tif` | Georeferenced GeoTIFF image |
-| `*_georef.tfw` | World file with transformation parameters |
-| `*_result.json` | Processing results and quality metrics |
-| `*_map.html` | Interactive map visualization (if generated) |
+| `000001_georef.tif` | Georeferenced GeoTIFF image |
+| `000001_georef.tfw` | World file with transformation parameters |
+| `000001_result.json` | Processing results and quality metrics |
+| `000001_map.html` | Interactive map visualization (if generated) |
+
+**Note:** Output files use the input directory name (e.g., `000001`) as the prefix, not the image filename. This prevents overwriting when processing multiple images to the same output directory.
 
 ### Result JSON Structure
 
@@ -266,9 +299,13 @@ The `diagnose steps` command generates:
 | `03_edges.png` | Edge detection - roads should be visible |
 | `04_binary_roads.png` | Road mask - should show thin lines, not blobs |
 | `05_skeleton.png` | Skeletonized roads - single-pixel width |
+| `05b_water_mask.png` | Detected water regions (white areas) |
+| `05c_shoreline_contours.png` | Extracted shorelines (cyan lines) |
 | `06_graph_overlay.png` | Detected junctions (green) and endpoints (cyan) |
 | `07_osm_network.png` | Reference OSM road network |
-| `08_match_candidates.png` | Matched points (green circles) |
+| `07b_osm_water.png` | OSM water features (coastlines, lakes, rivers) |
+| `08_match_candidates.png` | Road match candidates (green circles) |
+| `08b_shoreline_matches.png` | Shoreline match correspondences (yellow circles) |
 
 ### Common Issues
 
@@ -289,18 +326,23 @@ The `diagnose steps` command generates:
 │   Image     │────▶│   Road      │────▶│   Graph     │
 │   Input     │     │ Extraction  │     │  Building   │
 └─────────────┘     └─────────────┘     └─────────────┘
-                                               │
+      │                                        │
+      │             ┌─────────────┐            │
+      └────────────▶│   Water     │────────────┤
+                    │ Extraction  │            │
+                    └─────────────┘            │
                                                ▼
 ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│   GeoTIFF   │◀────│  Transform  │◀────│   Graph     │
+│   GeoTIFF   │◀────│  Transform  │◀────│  Combined   │
 │   Output    │     │ Estimation  │     │  Matching   │
 └─────────────┘     └─────────────┘     └─────────────┘
                                                ▲
-                                               │
-                          ┌─────────────┐      │
-                          │    OSM      │──────┘
-                          │    Data     │
-                          └─────────────┘
+                    ┌─────────────┐            │
+                    │  OSM Roads  │────────────┤
+                    └─────────────┘            │
+                    ┌─────────────┐            │
+                    │  OSM Water  │────────────┘
+                    └─────────────┘
 ```
 
 ### Processing Steps
@@ -341,35 +383,51 @@ The `diagnose steps` command generates:
 
 ## Configuration
 
-Default configuration can be modified in `src/auto_georef/config.py`:
+Configuration can be modified in `config.yaml` or `src/auto_georef/config.py`:
 
-```python
-@dataclass
-class OSMConfig:
-    search_radius_miles: float = 1.0
-    expanded_radius_miles: float = 2.0
-    network_type: str = "drive"
+### Key Configuration Options
 
-@dataclass
-class MatchingConfig:
-    min_correspondences: int = 5
-    ransac_threshold_meters: float = 15.0
-    ransac_max_iterations: int = 1000
+**OSM Settings:**
+```yaml
+osm:
+  search_radius_miles: 1.0      # Initial search radius
+  expanded_radius_miles: 2.0    # Expanded radius for sparse images
+  network_type: "drive"         # Road types to fetch
+```
 
-@dataclass
-class QualityConfig:
-    min_confidence_score: float = 0.5
-    max_rmse_meters: float = 15.0
-    min_matched_roads: int = 3
+**Matching Settings:**
+```yaml
+matching:
+  min_correspondences: 3        # Minimum matches required
+  ransac_threshold_meters: 50.0 # Historical images need larger threshold
+  rotation_range_deg: [-90, 90] # Full rotation search range
+```
+
+**Water/Shoreline Settings:**
+```yaml
+water:
+  enabled: true                 # Enable water feature detection
+  shoreline_weight: 1.5         # Shorelines weighted higher than roads
+  min_water_area_px: 500        # Minimum water body size
+  fetch_coastlines: true        # Fetch OSM coastlines
+  fetch_lakes: true             # Fetch OSM lakes
+  fetch_rivers: true            # Fetch OSM rivers
+```
+
+**Quality Thresholds:**
+```yaml
+quality:
+  min_confidence_score: 0.3     # Relaxed for historical images
+  max_rmse_meters: 50.0         # Historical images typically 20-50m accuracy
 ```
 
 ## Limitations
 
-- **Road-dependent**: Works best on images with visible road networks
-- **Water/vegetation**: Areas with mostly water or dense vegetation may fail
-- **Historical changes**: Roads that no longer exist won't match
-- **Scale estimation**: Requires some road intersections for accurate scale
-- **Rotation**: Large rotations (> 45°) may reduce matching accuracy
+- **Feature-dependent**: Works best on images with visible roads OR shorelines
+- **Dense vegetation**: Areas with dense vegetation and no roads/water may fail
+- **Historical road changes**: Roads that no longer exist won't match (shorelines are more stable)
+- **Scale estimation**: Requires some feature intersections for accurate scale
+- **Featureless areas**: Open farmland or desert with few distinguishing features may fail
 
 ## License
 

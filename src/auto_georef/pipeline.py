@@ -479,9 +479,58 @@ class GeoreferencePipeline:
                 debug_info=debug_info,
             )
 
+    def _find_native_image(self, input_dir: Path) -> Optional[Path]:
+        """Find the native (high-resolution) image file in a directory.
+
+        Searches for files containing 'native' in the name with common image
+        extensions (.tif, .tiff, .jpg, .jpeg, .png).
+
+        Args:
+            input_dir: Directory to search.
+
+        Returns:
+            Path to native image if found, None otherwise.
+        """
+        input_dir = Path(input_dir)
+        extensions = [".tif", ".tiff", ".jpg", ".jpeg", ".png"]
+
+        for ext in extensions:
+            # Try exact pattern first
+            candidates = list(input_dir.glob(f"*native*{ext}"))
+            if candidates:
+                return candidates[0]
+
+            # Also try case-insensitive on extension
+            candidates = list(input_dir.glob(f"*native*{ext.upper()}"))
+            if candidates:
+                return candidates[0]
+
+        return None
+
+    def _find_fallback_image(self, input_dir: Path) -> Optional[Path]:
+        """Find any suitable image file as fallback.
+
+        Args:
+            input_dir: Directory to search.
+
+        Returns:
+            Path to image if found, None otherwise.
+        """
+        input_dir = Path(input_dir)
+        extensions = [".tif", ".tiff", ".jpg", ".jpeg", ".png"]
+
+        for ext in extensions:
+            candidates = list(input_dir.glob(f"*{ext}")) + list(input_dir.glob(f"*{ext.upper()}"))
+            # Prefer non-thumbnail images
+            for c in candidates:
+                if "thumbnail" not in c.name.lower():
+                    return c
+
+        return None
+
     def process_directory(
         self, input_dir: Path, output_dir: Path
-    ) -> Tuple[Path, ...]:
+    ) -> "GeoreferenceResult":
         """Process a single item directory (e.g., data/000001/).
 
         Args:
@@ -494,13 +543,15 @@ class GeoreferencePipeline:
         input_dir = Path(input_dir)
         output_dir = Path(output_dir)
 
-        # Find image file
-        image_path = input_dir / "image_native.tif"
-        if not image_path.exists():
-            image_path = input_dir / "image_medium.jpg"
+        # Find image file - always prefer native (high-resolution) images
+        image_path = self._find_native_image(input_dir)
+        if image_path is None:
+            image_path = self._find_fallback_image(input_dir)
 
-        if not image_path.exists():
+        if image_path is None:
             raise FileNotFoundError(f"No image file found in {input_dir}")
+
+        logger.info(f"Using image: {image_path.name}")
 
         # Load metadata
         coords_path = input_dir / "coordinates.json"
@@ -511,5 +562,58 @@ class GeoreferencePipeline:
 
         metadata = ImageMetadata.from_json_files(coords_path, metadata_path)
 
-        # Process
-        return self.process(image_path, metadata, output_dir)
+        # Use directory name as base name for outputs (e.g., "000001")
+        base_name = input_dir.name
+
+        # Process with custom base name
+        return self.process_with_name(image_path, metadata, output_dir, base_name)
+
+    def process_with_name(
+        self,
+        image_path: Path,
+        metadata: ImageMetadata,
+        output_dir: Path,
+        base_name: str,
+    ) -> "GeoreferenceResult":
+        """Process a single image with a specified output base name.
+
+        Args:
+            image_path: Path to the input image.
+            metadata: Image metadata with approximate coordinates.
+            output_dir: Directory for output files.
+            base_name: Base name for output files.
+
+        Returns:
+            GeoreferenceResult with status and outputs.
+        """
+        # Run the processing pipeline
+        result = self.process(image_path, metadata, output_dir)
+
+        # If successful, rename outputs to use the specified base name
+        if result.success and result.output_paths:
+            # The process method already wrote files with image_path.stem
+            # We need to rename them to use base_name
+            old_stem = image_path.stem
+            if old_stem != base_name:
+                new_output_paths = {}
+                for key, old_path in result.output_paths.items():
+                    if old_path.exists():
+                        new_name = old_path.name.replace(old_stem, base_name)
+                        new_path = old_path.parent / new_name
+                        old_path.rename(new_path)
+                        new_output_paths[key] = new_path
+                    else:
+                        new_output_paths[key] = old_path
+
+                # Return result with updated paths
+                return GeoreferenceResult(
+                    success=result.success,
+                    confidence_score=result.confidence_score,
+                    transform=result.transform,
+                    quality=result.quality,
+                    output_paths=new_output_paths,
+                    error_message=result.error_message,
+                    debug_info=result.debug_info,
+                )
+
+        return result

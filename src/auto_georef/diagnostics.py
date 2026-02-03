@@ -8,6 +8,81 @@ import numpy as np
 import click
 
 
+def find_native_image(input_dir: Path) -> Optional[Path]:
+    """Find the native (high-resolution) image file in a directory.
+
+    Searches for files containing 'native' in the name with common image
+    extensions (.tif, .tiff, .jpg, .jpeg, .png).
+
+    Args:
+        input_dir: Directory to search.
+
+    Returns:
+        Path to native image if found, None otherwise.
+    """
+    input_dir = Path(input_dir)
+    extensions = [".tif", ".tiff", ".jpg", ".jpeg", ".png"]
+
+    for ext in extensions:
+        # Try pattern with native in name
+        candidates = list(input_dir.glob(f"*native*{ext}"))
+        if candidates:
+            return candidates[0]
+
+        # Also try uppercase extension
+        candidates = list(input_dir.glob(f"*native*{ext.upper()}"))
+        if candidates:
+            return candidates[0]
+
+    return None
+
+
+def find_fallback_image(input_dir: Path) -> Optional[Path]:
+    """Find any suitable image file as fallback.
+
+    Args:
+        input_dir: Directory to search.
+
+    Returns:
+        Path to image if found, None otherwise.
+    """
+    input_dir = Path(input_dir)
+    extensions = [".tif", ".tiff", ".jpg", ".jpeg", ".png"]
+
+    for ext in extensions:
+        candidates = list(input_dir.glob(f"*{ext}")) + list(input_dir.glob(f"*{ext.upper()}"))
+        # Prefer non-thumbnail images
+        for c in candidates:
+            if "thumbnail" not in c.name.lower():
+                return c
+
+    return None
+
+
+def find_image(input_dir: Path) -> Path:
+    """Find the best available image in a directory.
+
+    Prefers native (high-resolution) images, falls back to other images.
+
+    Args:
+        input_dir: Directory to search.
+
+    Returns:
+        Path to image.
+
+    Raises:
+        FileNotFoundError: If no image found.
+    """
+    image_path = find_native_image(input_dir)
+    if image_path is None:
+        image_path = find_fallback_image(input_dir)
+
+    if image_path is None:
+        raise FileNotFoundError(f"No image file found in {input_dir}")
+
+    return image_path
+
+
 @click.group()
 def diagnostics():
     """Diagnostic commands for evaluating georeferencing."""
@@ -189,9 +264,11 @@ def check_matching(input_dir: Path):
     click.echo(f"Approximate location: ({lat}, {lon})")
 
     # Load and process image
-    image_file = input_dir / "image_native.tif"
-    if not image_file.exists():
-        click.echo(click.style("ERROR: image_native.tif not found", fg="red"))
+    try:
+        image_file = find_image(input_dir)
+        click.echo(f"Using image: {image_file.name}")
+    except FileNotFoundError as e:
+        click.echo(click.style(f"ERROR: {e}", fg="red"))
         return
 
     enhancer = ImageEnhancer()
@@ -299,6 +376,10 @@ def visualize_steps(input_dir: Path, output_dir: Path):
 
     # Load metadata
     coords_file = input_dir / "coordinates.json"
+    if not coords_file.exists():
+        click.echo(click.style(f"ERROR: coordinates.json not found in {input_dir}", fg="red"))
+        return
+
     with open(coords_file) as f:
         coords = json.load(f)
     lat = coords.get("latitude", coords.get("lat"))
@@ -306,7 +387,13 @@ def visualize_steps(input_dir: Path, output_dir: Path):
 
     # Step 1: Load original
     enhancer = ImageEnhancer()
-    image_file = input_dir / "image_native.tif"
+    try:
+        image_file = find_image(input_dir)
+        click.echo(f"Using image: {image_file.name}")
+    except FileNotFoundError as e:
+        click.echo(click.style(f"ERROR: {e}", fg="red"))
+        return
+
     original = enhancer.load_image(image_file)
     cv2.imwrite(str(output_dir / "01_original.png"), original)
     click.echo("  1. Saved original image")
