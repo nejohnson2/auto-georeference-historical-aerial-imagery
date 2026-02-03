@@ -11,13 +11,20 @@ source .venv/bin/activate
 pip install -e .
 
 # 2. Process a single image
-python -m auto_georef single data/000001 output/
+make single ID=000001
 
 # 3. View the result
-python -m auto_georef visualize output/000001_georef.tif --open-browser
+make visualize ID=000001
 
 # 4. Debug if needed
-python -m auto_georef diagnose steps data/000001 -o diagnostic_output/
+make diagnose ID=000001
+```
+
+Or without Make:
+```bash
+python -m auto_georef single data/000001 output/000001
+python -m auto_georef visualize output/000001/000001_georef.tif
+python -m auto_georef diagnose steps data/000001 -o diagnostic_output/000001
 ```
 
 ## Overview
@@ -98,6 +105,45 @@ data/
 
 ## Usage
 
+### Using the Makefile (Recommended)
+
+The Makefile provides convenient shortcuts for common operations:
+
+```bash
+# List available images
+make list
+
+# Process a single image
+make single ID=000001
+
+# Process all images
+make batch
+
+# Generate diagnostic visualizations
+make diagnose ID=000001
+
+# Create map visualization (after processing)
+make visualize ID=000001
+
+# Analyze image and suggest parameter tuning
+make tune ID=000001
+
+# Full pipeline: process + visualize
+make full ID=000001
+
+# Full pipeline with diagnostics
+make full-debug ID=000001
+
+# Clean all outputs
+make clean
+
+# Clean outputs for specific image
+make clean-id ID=000001
+
+# Show all available commands
+make help
+```
+
 ### Single Image Processing
 
 ```bash
@@ -106,7 +152,7 @@ python -m auto_georef single <input_dir> <output_dir>
 
 Example:
 ```bash
-python -m auto_georef single data/000001 output/
+python -m auto_georef single data/000001 output/000001
 ```
 
 ### Batch Processing
@@ -138,7 +184,7 @@ Options:
 
 Example:
 ```bash
-python -m auto_georef visualize output/image_native_georef.tif --open-browser
+python -m auto_georef visualize output/000001/000001_georef.tif --open-browser
 ```
 
 ### Diagnostic Commands
@@ -154,13 +200,13 @@ Subcommands:
 #### Check GeoTIFF
 Inspect georeferencing parameters of a GeoTIFF:
 ```bash
-python -m auto_georef diagnose geotiff output/image_native_georef.tif
+python -m auto_georef diagnose geotiff output/000001/000001_georef.tif
 ```
 
 #### Check Transform
 Analyze transformation parameters from a result JSON:
 ```bash
-python -m auto_georef diagnose transform output/image_native_result.json
+python -m auto_georef diagnose transform output/000001/000001_result.json
 ```
 
 #### Check Matching
@@ -191,16 +237,29 @@ python -m auto_georef debug-osm <lat> <lon> [--radius 1.0]
 
 ## Output Files
 
-After processing, the output directory contains files named after the input directory:
+After processing, outputs are organized by image ID in subdirectories:
 
-| File | Description |
-|------|-------------|
-| `000001_georef.tif` | Georeferenced GeoTIFF image |
-| `000001_georef.tfw` | World file with transformation parameters |
-| `000001_result.json` | Processing results and quality metrics |
-| `000001_map.html` | Interactive map visualization (if generated) |
+```
+output/
+├── 000001/
+│   ├── 000001_georef.tif      # Georeferenced GeoTIFF image
+│   ├── 000001_georef.tfw      # World file with transformation parameters
+│   ├── 000001_result.json     # Processing results and quality metrics
+│   └── 000001_map.html        # Interactive map visualization
+├── 000242/
+│   └── ...
+└── batch_report.json          # Summary report (batch processing only)
 
-**Note:** Output files use the input directory name (e.g., `000001`) as the prefix, not the image filename. This prevents overwriting when processing multiple images to the same output directory.
+diagnostic_output/
+├── 000001/
+│   ├── 01_original.png
+│   ├── 02_enhanced.png
+│   └── ...
+└── 000242/
+    └── ...
+```
+
+**Note:** Output files use the input directory name (e.g., `000001`) as the prefix, not the image filename. Each image gets its own subdirectory to keep outputs organized.
 
 ### Result JSON Structure
 
@@ -247,7 +306,8 @@ Review the result JSON for key indicators:
 Open the HTML visualization in a browser:
 
 ```bash
-python -m auto_georef visualize output/image_georef.tif --open-browser
+make visualize ID=000001
+# Or: python -m auto_georef visualize output/000001/000001_georef.tif --open-browser
 ```
 
 **Evaluation checklist:**
@@ -275,17 +335,17 @@ python -m auto_georef visualize output/image_georef.tif --open-browser
 If results look incorrect, run the diagnostic tools:
 
 ```bash
+# Generate step-by-step visualizations
+make diagnose ID=000001
+
 # Check if GeoTIFF has valid bounds
-python -m auto_georef diagnose geotiff output/image_georef.tif
+make check-geotiff ID=000001
 
 # Analyze transformation parameters
-python -m auto_georef diagnose transform output/result.json
+make check-transform ID=000001
 
 # Debug the matching process
-python -m auto_georef diagnose matching data/000001
-
-# Generate step-by-step visualizations
-python -m auto_georef diagnose steps data/000001 -o diagnostic_output/
+make check-matching ID=000001
 ```
 
 ### Step 4: Review Diagnostic Images

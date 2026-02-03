@@ -8,6 +8,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime
 import logging
 import numpy as np
+from tqdm import tqdm
 
 from .config import GeoreferenceConfig, ImageMetadata
 from .pipeline import GeoreferencePipeline, GeoreferenceResult
@@ -72,16 +73,35 @@ class BatchProcessor:
         for coords_file in input_dir.rglob("coordinates.json"):
             item_dir = coords_file.parent
 
-            # Check for image file
-            has_image = (
-                (item_dir / "image_native.tif").exists()
-                or (item_dir / "image_medium.jpg").exists()
-            )
-
-            if has_image:
+            # Check for image file using flexible detection
+            if self._has_processable_image(item_dir):
                 processable.append(item_dir)
 
         return sorted(processable)
+
+    def _has_processable_image(self, item_dir: Path) -> bool:
+        """Check if directory has a processable image file.
+
+        Args:
+            item_dir: Directory to check.
+
+        Returns:
+            True if an image file exists.
+        """
+        extensions = [".tif", ".tiff", ".jpg", ".jpeg", ".png"]
+
+        # Check for native images first
+        for ext in extensions:
+            if list(item_dir.glob(f"*native*{ext}")) or list(item_dir.glob(f"*native*{ext.upper()}")):
+                return True
+
+        # Fallback: any non-thumbnail image
+        for ext in extensions:
+            for candidate in list(item_dir.glob(f"*{ext}")) + list(item_dir.glob(f"*{ext.upper()}")):
+                if "thumbnail" not in candidate.name.lower():
+                    return True
+
+        return False
 
     def process_single(
         self, item_dir: Path, output_dir: Path
@@ -164,24 +184,27 @@ class BatchProcessor:
         results = []
 
         if num_workers <= 1:
-            # Sequential processing
-            for i, item_dir in enumerate(image_dirs):
-                logger.info(f"Processing {i+1}/{len(image_dirs)}: {item_dir.name}")
+            # Sequential processing with progress bar
+            pbar = tqdm(image_dirs, desc="Processing images", unit="image")
+            for item_dir in pbar:
+                pbar.set_postfix(current=item_dir.name)
                 result = self.process_single(item_dir, output_dir)
                 results.append(result)
+                # Update description with status
+                status_icon = "✓" if result["status"] == "success" else "✗" if result["status"] == "failed" else "?"
+                pbar.set_postfix(current=item_dir.name, status=status_icon)
         else:
-            # Parallel processing
+            # Parallel processing with progress bar
             with ProcessPoolExecutor(max_workers=num_workers) as executor:
                 futures = {
                     executor.submit(self.process_single, item_dir, output_dir): item_dir
                     for item_dir in image_dirs
                 }
 
-                for i, future in enumerate(as_completed(futures)):
+                pbar = tqdm(as_completed(futures), total=len(futures), desc="Processing images", unit="image")
+                for future in pbar:
                     item_dir = futures[future]
-                    logger.info(
-                        f"Completed {i+1}/{len(image_dirs)}: {item_dir.name}"
-                    )
+                    pbar.set_postfix(completed=item_dir.name)
                     try:
                         result = future.result()
                         results.append(result)
