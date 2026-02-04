@@ -314,12 +314,13 @@ class GeoreferencePipeline:
                     debug_info["ransac_source"] = "road_only"
 
             # If RANSAC fails, try scale/rotation hypothesis search
+            hypothesis_scale = None
+            hypothesis_rotation = None
             if ransac_result is None:
                 logger.info("RANSAC failed, trying scale/rotation hypothesis search")
                 hypotheses = self.spectral_matcher.match_with_scale_rotation(
                     image_graph,
                     osm_graph,
-                    projection_info,
                     scale_range=self.config.matching.scale_range,
                     scale_steps=self.config.matching.scale_steps,
                     rotation_range=self.config.matching.rotation_range_deg,
@@ -339,6 +340,10 @@ class GeoreferencePipeline:
                         "best_rotation": best["rotation"],
                         "best_matches": best["num_matches"],
                     }
+
+                    # Store hypothesis parameters for transformation
+                    hypothesis_scale = best["scale"]
+                    hypothesis_rotation = best["rotation"]
 
                     # Try RANSAC on the best hypothesis candidates
                     best_candidates = best["correspondences"]
@@ -391,9 +396,20 @@ class GeoreferencePipeline:
             image_points = np.array(image_points)
             geo_points = np.array(geo_points)
 
-            transform = transform_estimator.estimate_from_correspondences(
-                image_points, geo_points, image.shape
-            )
+            # Use hypothesis-aware estimation if hypothesis search was used
+            if hypothesis_scale is not None and hypothesis_rotation is not None:
+                logger.info(
+                    f"Using hypothesis-aware transform estimation with "
+                    f"scale={hypothesis_scale:.3f}, rotation={hypothesis_rotation:.1f}°"
+                )
+                transform = transform_estimator.estimate_with_hypothesis(
+                    image_points, geo_points, image.shape,
+                    hypothesis_scale, hypothesis_rotation
+                )
+            else:
+                transform = transform_estimator.estimate_from_correspondences(
+                    image_points, geo_points, image.shape
+                )
 
             if transform is None:
                 return GeoreferenceResult(
@@ -436,15 +452,36 @@ class GeoreferencePipeline:
                 "description": metadata.description,
             }
 
-            correspondences = [
-                {
-                    "image_node": int(img_node),
-                    "osm_node": int(osm_node),
-                    "image_x": float(image_graph.nodes[img_node]["x"]),
-                    "image_y": float(image_graph.nodes[img_node]["y"]),
-                }
-                for img_node, osm_node in ransac_result.inlier_correspondences
-            ]
+            if using_combined and combined_candidates:
+                # In point-based RANSAC, inliers are stored as index tuples (i, i).
+                correspondences = []
+                for idx, _ in ransac_result.inlier_correspondences:
+                    if 0 <= idx < len(combined_candidates):
+                        img_pt, osm_pt, dist = combined_candidates[idx]
+                        correspondences.append(
+                            {
+                                # Preserve existing schema keys for downstream tools,
+                                # but these are indices into the combined list.
+                                "image_node": int(idx),
+                                "osm_node": int(idx),
+                                "image_x": float(img_pt[0]),
+                                "image_y": float(img_pt[1]),
+                                "osm_x_meters": float(osm_pt[0]),
+                                "osm_y_meters": float(osm_pt[1]),
+                                "match_distance": float(dist),
+                                "source": "combined",
+                            }
+                        )
+            else:
+                correspondences = [
+                    {
+                        "image_node": int(img_node),
+                        "osm_node": int(osm_node),
+                        "image_x": float(image_graph.nodes[img_node]["x"]),
+                        "image_y": float(image_graph.nodes[img_node]["y"]),
+                    }
+                    for img_node, osm_node in ransac_result.inlier_correspondences
+                ]
 
             output_paths = self.geotiff_writer.write_all(
                 image,

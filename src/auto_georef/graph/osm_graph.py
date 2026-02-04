@@ -1,5 +1,6 @@
 """Fetch and process OpenStreetMap road network data."""
 
+import logging
 import numpy as np
 import networkx as nx
 from pathlib import Path
@@ -8,6 +9,8 @@ import hashlib
 import json
 
 from ..config import OSMConfig
+
+logger = logging.getLogger(__name__)
 
 
 class OSMGraphBuilder:
@@ -67,7 +70,7 @@ class OSMGraphBuilder:
             )
         except Exception as e:
             # Return empty graph on failure
-            print(f"Warning: Failed to fetch OSM data: {e}")
+            logger.warning(f"Failed to fetch OSM data: {e}")
             return nx.Graph()
 
         # Convert to undirected graph

@@ -2,7 +2,7 @@
 
 import cv2
 import numpy as np
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Tuple, Optional
 from skimage import morphology, measure
 
@@ -207,7 +207,7 @@ class RoadExtractor:
 
         for i, variations in enumerate(param_variations[:max_attempts]):
             # Update config with variations
-            config = PreprocessingConfig()
+            config = replace(self.config)
             for key, value in variations.items():
                 setattr(config, key, value)
 

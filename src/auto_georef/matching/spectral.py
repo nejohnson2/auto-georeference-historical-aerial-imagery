@@ -154,7 +154,6 @@ class SpectralMatcher:
         self,
         image_graph: nx.Graph,
         osm_graph: nx.Graph,
-        osm_projection_info: dict,
         scale_range: Tuple[float, float] = (0.5, 2.0),
         scale_steps: int = 10,
         rotation_range: Tuple[float, float] = (-30, 30),
@@ -165,7 +164,6 @@ class SpectralMatcher:
         Args:
             image_graph: Graph from detected roads (pixel coordinates).
             osm_graph: Reference OSM graph (meter coordinates).
-            osm_projection_info: Projection info from OSM graph builder.
             scale_range: (min_scale, max_scale) in meters per pixel.
             scale_steps: Number of scale values to try.
             rotation_range: (min_rotation, max_rotation) in degrees.

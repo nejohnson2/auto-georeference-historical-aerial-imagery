@@ -2,7 +2,7 @@
 
 import cv2
 import numpy as np
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Optional, Tuple
 from scipy import ndimage
 
@@ -236,7 +236,7 @@ class WaterExtractor:
 
         for i, variations in enumerate(param_variations[:max_attempts]):
             # Create config with variations
-            config = WaterConfig()
+            config = replace(self.config)
             for key, value in variations.items():
                 setattr(config, key, value)
 

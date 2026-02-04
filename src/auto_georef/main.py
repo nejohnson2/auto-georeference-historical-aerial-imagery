@@ -370,7 +370,7 @@ def tune(input_dir: Path, config: Path):
     # Try scale/rotation hypothesis
     click.echo("\n5. Testing scale/rotation hypotheses...")
     hypotheses = spectral_matcher.match_with_scale_rotation(
-        image_graph, osm_graph, proj_info,
+        image_graph, osm_graph,
         scale_range=(0.3, 3.0),
         scale_steps=15,
         rotation_range=(-90, 90),
